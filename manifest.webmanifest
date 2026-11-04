@@ -1,0 +1,24 @@
+{
+  "name": "栖居 · 个人工作台",
+  "short_name": "栖居",
+  "description": "一个安静、本地优先的个人工作台",
+  "lang": "zh-CN",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#f3f2ec",
+  "theme_color": "#253b33",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
