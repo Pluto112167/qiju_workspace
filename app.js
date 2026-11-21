@@ -287,8 +287,30 @@
     };
   }
 
+  function normalizePlans(rawPlans, legacy = {}) {
+    let plans = Array.isArray(rawPlans) ? rawPlans : [];
+    if (!plans.length && isDateKey(legacy.scheduledDate)) {
+      plans = [{ date: legacy.scheduledDate, startTime: legacy.startTime }];
+    }
+    const seen = new Set();
+    return plans
+      .filter((plan) => plan && isDateKey(plan.date))
+      .map((plan) => {
+        const date = plan.date;
+        const startTime = isTimeValue(plan.startTime) ? plan.startTime : '';
+        const key = `${date}|${startTime}`;
+        if (seen.has(key)) return null;
+        seen.add(key);
+        return { id: String(plan.id || uid('plan')), date, startTime };
+      })
+      .filter(Boolean)
+      .sort((a, b) => `${a.date} ${a.startTime}`.localeCompare(`${b.date} ${b.startTime}`));
+  }
+
   function normalizeTask(raw = {}) {
     const status = Object.prototype.hasOwnProperty.call(STATUS, raw.status) ? raw.status : 'todo';
+    const plans = normalizePlans(raw.plans, raw);
+    const firstPlan = plans[0];
     return {
       id: String(raw.id || uid('task')),
       title: String(raw.title || '').slice(0, 200),
@@ -299,9 +321,10 @@
       status,
       priority: [1, 2, 3].includes(Number(raw.priority)) ? Number(raw.priority) : 2,
       due: isDateKey(raw.due) ? raw.due : '',
-      scheduledDate: isDateKey(raw.scheduledDate) ? raw.scheduledDate : '',
-      startTime: isTimeValue(raw.startTime) ? raw.startTime : '',
-      endTime: isTimeValue(raw.endTime) ? raw.endTime : '',
+      plans,
+      scheduledDate: firstPlan ? firstPlan.date : '',
+      startTime: firstPlan ? firstPlan.startTime : '',
+      endTime: '',
       estimate: clamp(Number(raw.estimate) || 60, 5, 1440),
       createdAt: raw.createdAt || new Date().toISOString(),
       completedAt: raw.completedAt || null
@@ -338,13 +361,15 @@
 
   function normalizeDay(raw = {}, settings = defaultSettings()) {
     const base = makeDay(settings.waterGoal, settings.vocabGoal);
+    const rawMood = Number(raw.mood);
+    const mood = rawMood === 4 || rawMood === 5 ? 5 : rawMood === 3 ? 3 : rawMood ? 1 : null;
     return {
       ...base,
       ...raw,
       meals: { ...base.meals, ...(raw.meals || {}) },
       exercise: { ...base.exercise, ...(raw.exercise || {}) },
       sleep: { ...base.sleep, ...(raw.sleep || {}) },
-      mood: [1, 2, 3, 4, 5].includes(Number(raw.mood)) ? Number(raw.mood) : null,
+      mood,
       water: Math.max(0, Number(raw.water) || 0),
       waterGoal: clamp(Number(raw.waterGoal) || base.waterGoal, 1, 30),
       vocab: Math.max(0, Number(raw.vocab) || 0),
@@ -501,7 +526,7 @@
     today: { title: '今日', subtitle: () => formatDateLong(ui.dayDate) },
     tasks: { title: '任务', subtitle: () => '轻一点记录，稳一点完成。' },
     calendar: { title: '月历', subtitle: () => formatMonth(ui.calendarCursor) },
-    week: { title: '周视图', subtitle: () => `${formatWeekRange(startOfWeekKey(dateKey(ui.weekCursor)), endOfWeekKey(dateKey(ui.weekCursor)))} · 按时间分布` },
+    week: { title: '周视图', subtitle: () => `${formatWeekRange(startOfWeekKey(dateKey(ui.weekCursor)), endOfWeekKey(dateKey(ui.weekCursor)))} · 按天安排` },
     study: { title: '学习', subtitle: () => '学习时长手动记录，不必精确到分钟。' },
     projects: { title: '项目', subtitle: () => '把目标拆成可以完成的小块。' },
     stats: { title: '统计', subtitle: () => '不追求满分，看看趋势。' },
@@ -549,21 +574,32 @@
     return (task.tagIds || []).map(tagById).filter(Boolean);
   }
 
+  function sortedPlans(task) {
+    return (task.plans || []).slice().sort((a, b) => `${a.date} ${a.startTime || ''}`.localeCompare(`${b.date} ${b.startTime || ''}`));
+  }
+
+  function syncTaskLegacy(task) {
+    const first = sortedPlans(task)[0];
+    task.scheduledDate = first ? first.date : '';
+    task.startTime = first ? first.startTime : '';
+    task.endTime = '';
+  }
+
   function taskDates(task) {
     const result = new Set();
     if (task.due) result.add(task.due);
-    if (task.scheduledDate) result.add(task.scheduledDate);
+    const plans = sortedPlans(task);
+    if (plans.length) {
+      plans.forEach((plan) => { if (plan.date) result.add(plan.date); });
+    } else if (task.scheduledDate) {
+      result.add(task.scheduledDate);
+    }
     return [...result];
   }
 
   function primaryDate(task) {
-    return task.scheduledDate || task.due || '';
-  }
-
-  function timelineDate(task, start, end) {
-    if (task.scheduledDate && task.scheduledDate >= start && task.scheduledDate <= end) return task.scheduledDate;
-    if (task.due && task.due >= start && task.due <= end) return task.due;
-    return '';
+    const plans = sortedPlans(task);
+    return (plans[0] && plans[0].date) || task.scheduledDate || task.due || '';
   }
 
   function isOpen(task) {
@@ -591,8 +627,8 @@
     const dateA = primaryDate(a) || '9999-12-31';
     const dateB = primaryDate(b) || '9999-12-31';
     if (dateA !== dateB) return dateA.localeCompare(dateB);
-    const timeA = a.startTime || '99:99';
-    const timeB = b.startTime || '99:99';
+    const timeA = (sortedPlans(a)[0] && sortedPlans(a)[0].startTime) || '99:99';
+    const timeB = (sortedPlans(b)[0] && sortedPlans(b)[0].startTime) || '99:99';
     if (timeA !== timeB) return timeA.localeCompare(timeB);
     return Number(b.priority) - Number(a.priority);
   }
@@ -612,11 +648,13 @@
   function getOverallStats() {
     const tasks = state.tasks.filter((task) => task.status !== 'cancelled');
     const done = tasks.filter(isDone);
+    const open = tasks.filter(isOpen);
     const overdue = tasks.filter((task) => isOverdue(task));
     return {
       tasks,
       total: tasks.length,
       done: done.length,
+      open: open.length,
       overdue: overdue.length,
       rate: tasks.length ? Math.round((done.length / tasks.length) * 100) : 0
     };
@@ -1004,8 +1042,12 @@
     const project = projectById(task.projectId);
     const tags = tagsForTask(task);
     const overdue = isOverdue(task);
-    const scheduled = task.scheduledDate ? `${formatMD(task.scheduledDate)}${task.startTime ? ` ${task.startTime}` : ''}` : '';
-    const due = task.due && task.due !== task.scheduledDate ? `截止 ${formatMD(task.due)}` : '';
+    const plans = sortedPlans(task);
+    const firstPlan = plans[0];
+    const scheduled = firstPlan
+      ? `${formatMD(firstPlan.date)}${firstPlan.startTime ? ` ${firstPlan.startTime}` : ''}${plans.length > 1 ? ` +${plans.length - 1}` : ''}`
+      : '';
+    const due = task.due && (!firstPlan || task.due !== firstPlan.date) ? `截止 ${formatMD(task.due)}` : '';
     const search = [task.title, project ? project.name : '', ...tags.map((tag) => tag.name)].join(' ').toLowerCase();
     const statusClass = task.status === 'done' ? 'is-done' : task.status === 'doing' ? 'is-doing' : '';
     const meta = [];
@@ -1143,6 +1185,7 @@
 
   views.dashboard = function dashboardView() {
     const week = getWeekStats();
+    const overall = getOverallStats();
     const today = todayKey();
     const day = peekDay(today);
     const todayTasks = tasksForDate(today).filter(isOpen);
@@ -1181,7 +1224,7 @@
         <div class="hero-main">
           <p class="eyebrow">${formatDateLong(today)}</p>
           <h2>${esc(greetingWord())}${state.settings.character.address ? `，<em>${esc(state.settings.character.address)}</em>` : '。'}</h2>
-          <p class="hero-lead">${week.tasks.length ? `本周有 ${week.tasks.length} 件事，完成了 ${week.done.length} 件。把注意力放回今天。` : '工作台还是一张白纸。先写下一件真正想完成的事。'}</p>
+          <p class="hero-lead">${overall.total ? `目前有 ${overall.total} 件事，完成了 ${overall.done} 件。把注意力放回今天。` : '工作台还是一张白纸。先写下一件真正想完成的事。'}</p>
           <div class="hero-actions">
             <a class="btn btn-primary" href="#/today">进入今天 ${icon('arrow')}</a>
             <button class="btn btn-ghost" type="button" data-action="new-task" data-date="${today}">${icon('plus')} 添加任务</button>
@@ -1191,10 +1234,10 @@
       </section>
 
       <div class="kpi-grid">
-        ${kpiCard('本周待办', week.open.length, '项', `${week.done.length} 项已完成`, 'week', 'list', '#4c6b5d', '#dfe9e2')}
-        ${kpiCard('进行中', state.tasks.filter((task) => task.status === 'doing').length, '项', week.open.length ? `本周还有 ${week.open.length} 项待办` : '目前没有待办', 'doing', 'play', '#78929c', '#e3ebee')}
-        ${kpiCard('本周逾期', week.overdue.length, '项', `累计 ${getOverallStats().overdue} 项逾期`, 'weekOverdue', 'alert', '#a46057', '#f3e4e1')}
-        ${kpiCardValue('本周完成率', `${week.rate}`, '%', `完成 ${week.done.length} / ${week.tasks.length} 项`, 'week', 'target', '#b08a5d', '#f3eadc', week.rate)}
+        ${kpiCard('全部待办', overall.open, '项', `${overall.done} 项已完成`, 'open', 'list', '#4c6b5d', '#dfe9e2')}
+        ${kpiCard('进行中', state.tasks.filter((task) => task.status === 'doing').length, '项', overall.open ? `全部还有 ${overall.open} 项待办` : '目前没有待办', 'doing', 'play', '#78929c', '#e3ebee')}
+        ${kpiCard('累计逾期', overall.overdue, '项', `共 ${overall.total} 项任务`, 'overdue', 'alert', '#a46057', '#f3e4e1')}
+        ${kpiCardValue('总完成率', `${overall.rate}`, '%', `完成 ${overall.done} / ${overall.total} 项`, 'all', 'target', '#b08a5d', '#f3eadc', overall.rate)}
       </div>
 
       <div class="dash-grid">
@@ -1326,9 +1369,7 @@
     const eyes = '<circle cx="9.2" cy="9.5" r=".75" fill="currentColor"/><circle cx="14.8" cy="9.5" r=".75" fill="currentColor"/>';
     const mouth = {
       1: '<path d="M9 16.1c1.2-2.1 4.8-2.1 6 0"/>',
-      2: '<path d="M9.2 16h5.6"/>',
       3: '<path d="M9 15.2h6"/>',
-      4: '<path d="M9 14.3c1 1.9 5 1.9 6 0"/>',
       5: '<path d="M8.7 13.8c1.1 2.9 5.5 2.9 6.6 0"/>'
     };
     return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/>${eyes}${mouth[value] || mouth[3]}</svg>`;
@@ -1336,7 +1377,7 @@
 
   function moodButtons(day, dateKeyValue, size = 'small') {
     const moods = [
-      [1, '低落'], [2, '疲惫'], [3, '平常'], [4, '不错'], [5, '很好']
+      [1, '低落'], [3, '平静'], [5, '开心']
     ];
     return `<div class="mood-picker ${size === 'large' ? 'mood-large' : ''}">${moods.map(([value, label]) => `<button class="mood-btn ${Number(day.mood) === value ? 'active' : ''}" type="button" data-action="mood-set" data-date="${dateKeyValue}" data-mood="${value}" title="${label}" aria-label="${label}">${moodFace(value)}</button>`).join('')}</div>`;
   }
@@ -1508,6 +1549,7 @@
       <div class="page-toolbar">
         <div class="segmented">
           ${taskFilterButton('all', '全部')}
+          ${taskFilterButton('open', '未完成')}
           ${taskFilterButton('today', '今天')}
           ${taskFilterButton('week', '本周')}
           ${taskFilterButton('weekOverdue', '本周逾期')}
@@ -1562,7 +1604,7 @@
   }
 
   function filterLabel(key) {
-    return { all: '全部任务', today: '今天', week: '本周', weekOverdue: '本周逾期', overdue: '累计逾期', doing: '进行中', done: '已完成' }[key] || '全部任务';
+    return { all: '全部任务', open: '未完成任务', today: '今天', week: '本周', weekOverdue: '本周逾期', overdue: '累计逾期', doing: '进行中', done: '已完成' }[key] || '全部任务';
   }
 
   function filteredTasks() {
@@ -1570,7 +1612,8 @@
     const weekStart = startOfWeekKey(today);
     const weekEnd = endOfWeekKey(today);
     let list = state.tasks.filter((task) => task.status !== 'cancelled');
-    if (ui.taskFilter === 'today') list = list.filter((task) => taskDates(task).includes(today));
+    if (ui.taskFilter === 'open') list = list.filter(isOpen);
+    else if (ui.taskFilter === 'today') list = list.filter((task) => taskDates(task).includes(today));
     else if (ui.taskFilter === 'week') list = list.filter((task) => taskDates(task).some((date) => date >= weekStart && date <= weekEnd));
     else if (ui.taskFilter === 'weekOverdue') list = list.filter((task) => isOverdue(task) && task.due >= weekStart && task.due <= weekEnd);
     else if (ui.taskFilter === 'overdue') list = list.filter((task) => isOverdue(task));
@@ -1641,16 +1684,22 @@
     const start = startOfWeekKey(dateKey(cursor));
     const end = endOfWeekKey(dateKey(cursor));
     const days = weekKeys(dateKey(cursor));
-    const scheduled = state.tasks.filter((task) => task.status !== 'cancelled' && task.startTime
-      && timelineDate(task, start, end));
-    const unscheduled = state.tasks.filter((task) => isOpen(task) && !task.startTime
-      && taskDates(task).some((date) => date >= start && date <= end));
-    const now = new Date();
-    const nowMinutes = now.getHours() * 60 + now.getMinutes();
-    const showNow = days.includes(todayKey()) && nowMinutes >= 360 && nowMinutes < 1440;
+    const entries = [];
+    state.tasks
+      .filter((task) => task.status !== 'cancelled')
+      .forEach((task) => {
+        sortedPlans(task).forEach((plan) => {
+          if (plan.date >= start && plan.date <= end) entries.push({ task, plan });
+        });
+      });
+    const backlog = state.tasks.filter((task) => isOpen(task)
+      && !sortedPlans(task).some((plan) => plan.date >= start && plan.date <= end));
     return `
       <div class="week-toolbar">
-        <div class="week-range">${formatWeekRange(start, end)}</div>
+        <div class="week-range-wrap">
+          <div class="week-range">${formatWeekRange(start, end)}</div>
+          <p class="week-range-note">先决定哪天做，不要求预估时长；一个任务可以分到多天。</p>
+        </div>
         <div class="calendar-nav">
           <button class="icon-btn" type="button" data-action="week-prev" aria-label="上一周">${icon('left')}</button>
           <button class="btn btn-ghost btn-sm" type="button" data-action="week-today">本周</button>
@@ -1660,70 +1709,78 @@
           <button class="btn btn-soft btn-sm" type="button" data-action="new-task">${icon('plus')} 新任务</button>
         </div>
       </div>
-      <div class="week-layout">
-        <section class="week-panel">
-          <div class="week-scroll">
-            <div class="week-head">
-              <div class="week-gutter-head"></div>
-              <div class="week-day-heads">
-                ${days.map((key) => {
-                  const date = parseDateKey(key);
-                  return `<div class="week-day-head ${key === todayKey() ? 'today' : ''}">
-                    <div class="week-day-name">周${WEEKDAYS[(date.getDay() + 6) % 7]}</div>
-                    <div class="week-day-num">${date.getDate()}</div>
-                  </div>`;
-                }).join('')}
+
+      <section class="card board-backlog">
+        <div class="card-head">
+          <div class="card-head-main">
+            <h2 class="card-title">${icon('list')} 待安排</h2>
+            <p class="card-sub">${backlog.length ? '拖到下面任意一天；也可以点开任务编辑计划。' : '本周的任务都已经安排好了。'}</p>
+          </div>
+          <span class="pill">${backlog.length} 项</span>
+        </div>
+        <div class="backlog-strip">
+          ${backlog.length ? backlog.map(backlogTaskHTML).join('') : '<div class="backlog-empty">没有待安排的任务。点某一天的「添加任务」也可以直接开始。</div>'}
+        </div>
+      </section>
+
+      <div class="week-board">
+        ${days.map((key) => {
+          const date = parseDateKey(key);
+          const dayEntries = entries.filter((entry) => entry.plan.date === key);
+          return `<section class="board-day ${key === todayKey() ? 'today' : ''}" data-drop-date="${key}">
+            <div class="board-day-head">
+              <div class="board-day-date">
+                <span>${WEEKDAY_FULL[(date.getDay() + 6) % 7]}</span>
+                <strong>${date.getDate()}</strong>
+                <small>${date.getMonth() + 1}月</small>
               </div>
+              <span class="board-day-count">${dayEntries.length ? `${dayEntries.length} 项` : '空'}</span>
             </div>
-            <div class="week-body">
-              <div class="time-gutter">
-                ${Array.from({ length: 18 }, (_, index) => `<div class="time-label">${pad2(index + 6)}:00</div>`).join('')}
-              </div>
-              <div class="week-columns">
-                ${days.map((key) => {
-                  const dayTasks = scheduled.filter((task) => timelineDate(task, start, end) === key);
-                  return `<div class="week-col" data-action="week-slot" data-date="${key}">
-                    ${dayTasks.map((task) => weekTaskHTML(task)).join('')}
-                    ${key === todayKey() && showNow ? `<div class="now-line" style="top:${((nowMinutes - 360) / 60) * 48}px"></div>` : ''}
-                  </div>`;
-                }).join('')}
-              </div>
+            <div class="board-day-body">
+              ${dayEntries.length ? dayEntries.map((entry) => boardPlanHTML(entry.task, entry.plan)).join('') : '<div class="board-day-empty">把待安排任务拖到这里</div>'}
+              <button class="board-add" type="button" data-action="new-task" data-plan-date="${key}">${icon('plus')} 添加任务</button>
             </div>
-          </div>
-        </section>
-        <aside class="week-side">
-          <div>
-            <h3>本周待排期</h3>
-            <p>${unscheduled.length ? `${unscheduled.length} 件事还没有放进时间轴` : '都安排好了。'}</p>
-          </div>
-          <div class="unscheduled-list">
-            ${unscheduled.slice(0, 8).map((task) => {
-              const project = projectById(task.projectId);
-              return `<button class="unscheduled-item" type="button" data-action="edit-task" data-id="${task.id}">
-                <span class="dot" style="--dot-color:${project ? project.color : '#4c6b5d'}"></span>
-                <span>${esc(task.title)}</span>
-                <small>${taskDates(task).length ? formatMD(taskDates(task)[0]) : '无日期'}</small>
-              </button>`;
-            }).join('') || '<div class="empty-state" style="min-height:80px;padding:14px"><p>本周没有待排期的任务。</p></div>'}
-          </div>
-          <div class="week-hint">${icon('info')} 点击空白时间格，可以按半小时为粒度添加任务；点击任务可调整时间。</div>
-          <button class="btn btn-ghost btn-sm" type="button" data-action="new-task">${icon('plus')} 添加任务</button>
-        </aside>
-      </div>`;
+          </section>`;
+        }).join('')}
+      </div>
+      <div class="week-hint week-hint-bottom">${icon('info')} 桌面端可以拖动任务卡片调整日期；点击卡片编辑任务或增加下一个计划。卡片上的 × 只会从这一天移除，不会删除任务。</div>`;
   };
 
-  function weekTaskHTML(task) {
+  function backlogTaskHTML(task) {
     const project = projectById(task.projectId);
-    const color = project ? project.color : '#4c6b5d';
-    const start = timeToMinutes(task.startTime) ?? 540;
-    const end = timeToMinutes(task.endTime) ?? start + Math.max(30, Number(task.estimate) || 60);
-    const duration = Math.max(20, end - start);
-    const top = Math.max(0, ((start - 360) / 60) * 48);
-    const height = Math.max(22, (duration / 60) * 48 - 2);
-    const time = `${task.startTime}${task.endTime ? `–${task.endTime}` : ''}`;
-    return `<button class="week-task ${task.status === 'done' ? 'done' : ''} ${isOverdue(task) ? 'overdue' : ''}" type="button" data-action="edit-task" data-id="${task.id}" style="top:${top}px;height:${height}px;--task-color:${color};--task-bg:${hexToRgba(color, 0.14)}" title="${escAttr(`${task.title} · ${time}`)}">
-      <strong>${esc(task.title)}</strong><small>${esc(time)}${project ? ` · ${esc(project.name)}` : ''}</small>
-    </button>`;
+    const plans = sortedPlans(task);
+    return `<article class="backlog-task" draggable="true" data-drag-type="task" data-task-id="${task.id}" data-action="edit-task" data-id="${task.id}" role="button" tabindex="0">
+      <div class="backlog-task-top">
+        <span class="dot" style="--dot-color:${project ? project.color : '#4c6b5d'}"></span>
+        <strong>${esc(task.title)}</strong>
+      </div>
+      <div class="backlog-task-meta">
+        <span>${project ? esc(project.name) : '收件箱'}</span>
+        ${task.due ? `<span>截止 ${formatMD(task.due)}</span>` : ''}
+        ${plans.length ? '<span>其他日期已有计划</span>' : ''}
+      </div>
+    </article>`;
+  }
+
+  function boardPlanHTML(task, plan) {
+    const project = projectById(task.projectId);
+    const done = task.status === 'done';
+    const plans = sortedPlans(task);
+    return `<article class="board-plan ${done ? 'is-done' : ''}" draggable="true" data-drag-type="plan" data-task-id="${task.id}" data-plan-id="${plan.id}" data-action="edit-task" data-id="${task.id}" role="button" tabindex="0" style="--project-color:${project ? project.color : '#4c6b5d'}">
+      <div class="board-plan-top">
+        <button class="task-check ${done ? 'is-done' : ''}" type="button" data-action="toggle-task" data-id="${task.id}" aria-label="${done ? '取消完成' : '标记完成'}">${icon('check')}</button>
+        <div class="board-plan-main">
+          <strong>${esc(task.title)}</strong>
+          <small>${project ? esc(project.name) : '收件箱'}${plan.startTime ? ` · ${plan.startTime}` : ''}</small>
+        </div>
+        <button class="board-plan-remove" type="button" data-action="remove-plan" data-task-id="${task.id}" data-plan-id="${plan.id}" aria-label="从这一天移除">×</button>
+      </div>
+      <div class="board-plan-foot">
+        ${task.due ? `<span class="${isOverdue(task) ? 'overdue' : ''}">截止 ${formatMD(task.due)}</span>` : '<span>无截止日期</span>'}
+        ${plans.length > 1 ? `<span>共 ${plans.length} 天</span>` : ''}
+        ${task.priority === 3 ? '<span class="pill pill-amber">高优先</span>' : ''}
+      </div>
+    </article>`;
   }
 
   views.study = function studyView() {
@@ -2042,6 +2099,15 @@
 
   // Modal and interaction helpers continue below.
 
+  function planRowHTML(plan = {}) {
+    return `<div class="plan-row" data-plan-row>
+      <input type="hidden" name="planId" value="${escAttr(plan.id || '')}">
+      <input type="date" name="planDate" value="${escAttr(plan.date || '')}" aria-label="计划日期">
+      <input type="time" name="planTime" value="${escAttr(plan.startTime || '')}" aria-label="开始时间，可选">
+      <button class="icon-only" type="button" data-action="remove-plan-row" aria-label="移除这个计划">${icon('close')}</button>
+    </div>`;
+  }
+
   function openTaskModal(taskId = null, defaults = {}) {
     const existing = taskId ? taskById(taskId) : null;
     const task = existing ? { ...existing } : normalizeTask({
@@ -2049,14 +2115,14 @@
       title: '',
       status: 'todo',
       priority: 2,
-      estimate: 60,
       ...defaults
     });
+    const planRows = sortedPlans(task).length ? sortedPlans(task) : [{}];
     openModal(`<div class="modal">
       <div class="modal-head">
         <div class="modal-head-copy">
           <h2>${existing ? '编辑任务' : '新任务'}</h2>
-          <p>任务会同步出现在月历、周视图和首页。</p>
+          <p>计划可以填多个日期；不需要预估总时长。</p>
         </div>
         <button class="modal-close" type="button" data-action="close-modal" aria-label="关闭">×</button>
       </div>
@@ -2067,12 +2133,16 @@
             <div class="field"><label>项目</label><select name="projectId" id="taskProject" data-role="task-project">${projectOptions(task.projectId, '收件箱')}</select></div>
             <div class="field"><label>分区</label><select name="sectionId" id="taskSection">${sectionOptions(task.projectId, task.sectionId)}</select></div>
             <div class="field"><label>截止日期</label><input name="due" type="date" value="${escAttr(task.due)}"></div>
-            <div class="field"><label>计划日期</label><input name="scheduledDate" type="date" value="${escAttr(task.scheduledDate)}"></div>
-            <div class="field"><label>开始时间</label><input name="startTime" type="time" value="${escAttr(task.startTime)}"></div>
-            <div class="field"><label>结束时间</label><input name="endTime" type="time" value="${escAttr(task.endTime)}"></div>
             <div class="field"><label>状态</label><select name="status">${Object.entries(STATUS).filter(([key]) => key !== 'cancelled').map(([key, label]) => `<option value="${key}" ${task.status === key ? 'selected' : ''}>${label}</option>`).join('')}</select></div>
             <div class="field"><label>优先级</label><select name="priority">${Object.entries(PRIORITY).map(([key, label]) => `<option value="${key}" ${String(task.priority) === key ? 'selected' : ''}>${label}</option>`).join('')}</select></div>
-            <div class="field"><label>预计时长（分钟）</label><input name="estimate" type="number" min="5" max="1440" value="${escAttr(task.estimate)}"></div>
+            <div class="field full">
+              <label>计划日期（可多个，时间可选）</label>
+              <div class="plan-rows" id="planRows">${planRows.map((plan) => planRowHTML(plan)).join('')}</div>
+              <div class="plan-editor-foot">
+                <button class="btn btn-ghost btn-sm" type="button" data-action="add-plan-row">${icon('plus')} 加一个计划</button>
+                <span class="field-hint">只决定哪天做；做不完可以再加一天。</span>
+              </div>
+            </div>
             <div class="field full"><label>标签</label><input name="tags" type="text" value="${escAttr(tagInputValue(task))}" placeholder="用逗号分隔，比如：英语, 本周重点"><span class="field-hint">新标签会自动创建，可在设置里删除。</span></div>
             <div class="field full"><label>备注</label><textarea name="notes" rows="3" placeholder="补充说明、资料链接，或者下一步动作。">${esc(task.notes)}</textarea></div>
           </div>
@@ -2190,7 +2260,9 @@
 
   function projectDetailTaskHTML(task) {
     const due = task.due ? `截止 ${formatMD(task.due)}` : '';
-    const scheduled = task.scheduledDate ? `${formatMD(task.scheduledDate)}${task.startTime ? ` ${task.startTime}` : ''}` : '';
+    const plans = sortedPlans(task);
+    const firstPlan = plans[0];
+    const scheduled = firstPlan ? `${formatMD(firstPlan.date)}${plans.length > 1 ? ` +${plans.length - 1}` : ''}` : '';
     const meta = [STATUS[task.status], scheduled, due].filter(Boolean).join(' · ');
     return `<div class="project-detail-task ${task.status === 'done' ? 'is-done' : ''}" data-action="edit-task" data-id="${task.id}" role="button" tabindex="0">
       <button class="task-check ${task.status === 'done' ? 'is-done' : ''}" type="button" data-action="toggle-task" data-id="${task.id}" aria-label="${task.status === 'done' ? '取消完成' : '标记完成'}">${icon('check')}</button>
@@ -2243,9 +2315,10 @@
         <div class="day-modal-list">
           ${tasks.length ? tasks.map((task) => {
             const project = projectById(task.projectId);
+            const plan = sortedPlans(task).find((item) => item.date === key);
             return `<div class="day-modal-task ${task.status === 'done' ? 'is-done' : ''}" data-action="edit-task" data-id="${task.id}">
               <button class="task-check ${task.status === 'done' ? 'is-done' : ''}" type="button" data-action="toggle-task" data-id="${task.id}" aria-label="标记完成">${icon('check')}</button>
-              <div class="day-modal-task-main"><strong>${esc(task.title)}</strong><small>${project ? esc(project.name) : '收件箱'}${task.startTime ? ` · ${task.startTime}` : ''}${task.due ? ` · 截止 ${formatMD(task.due)}` : ''}</small></div>
+              <div class="day-modal-task-main"><strong>${esc(task.title)}</strong><small>${project ? esc(project.name) : '收件箱'}${plan && plan.startTime ? ` · ${plan.startTime}` : ''}${task.due ? ` · 截止 ${formatMD(task.due)}` : ''}</small></div>
             </div>`;
           }).join('') : '<div class="empty-state" style="min-height:100px"><span class="empty-mark">' + icon('leaf') + '</span><p>空着也很好。如果想加一件事，点击下面。</p></div>'}
         </div>
@@ -2646,6 +2719,23 @@
       ? String(data.get('sectionId') || '')
       : '';
     const status = String(data.get('status') || 'todo');
+    const planIds = data.getAll('planId').map((value) => String(value || ''));
+    const planDates = data.getAll('planDate').map((value) => String(value || ''));
+    const planTimes = data.getAll('planTime').map((value) => String(value || ''));
+    const seenPlans = new Set();
+    const plans = planDates.map((date, index) => {
+      if (!isDateKey(date)) return null;
+      const startTime = isTimeValue(planTimes[index]) ? planTimes[index] : '';
+      const key = `${date}|${startTime}`;
+      if (seenPlans.has(key)) return null;
+      seenPlans.add(key);
+      return {
+        id: planIds[index] || uid('plan'),
+        date,
+        startTime
+      };
+    }).filter(Boolean).sort((a, b) => `${a.date} ${a.startTime}`.localeCompare(`${b.date} ${b.startTime}`));
+    const firstPlan = plans[0];
     const taskData = {
       title,
       notes: String(data.get('notes') || ''),
@@ -2655,10 +2745,10 @@
       status,
       priority: Number(data.get('priority')) || 2,
       due: String(data.get('due') || ''),
-      scheduledDate: String(data.get('scheduledDate') || ''),
-      startTime: String(data.get('startTime') || ''),
-      endTime: String(data.get('endTime') || ''),
-      estimate: Number(data.get('estimate')) || 60,
+      plans,
+      scheduledDate: firstPlan ? firstPlan.date : '',
+      startTime: firstPlan ? firstPlan.startTime : '',
+      endTime: '',
       completedAt: status === 'done' ? (existing && existing.completedAt ? existing.completedAt : new Date().toISOString()) : null
     };
     if (existing) {
@@ -2817,6 +2907,84 @@
     if (field === 'exercise.minutes') refreshHabitSummaryUI(key);
   }
 
+  function clearDragHighlights() {
+    $$('.board-day.is-drag-over').forEach((day) => day.classList.remove('is-drag-over'));
+    $$('.is-dragging').forEach((card) => card.classList.remove('is-dragging'));
+  }
+
+  function handleDragStart(event) {
+    const card = event.target.closest('[data-drag-type]');
+    if (!card) return;
+    const payload = {
+      type: card.dataset.dragType,
+      taskId: card.dataset.taskId,
+      planId: card.dataset.planId || ''
+    };
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', JSON.stringify(payload));
+    card.classList.add('is-dragging');
+  }
+
+  function handleDragOver(event) {
+    const day = event.target.closest('[data-drop-date]');
+    if (!day) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    $$('.board-day.is-drag-over').forEach((item) => item.classList.toggle('is-drag-over', item === day));
+  }
+
+  function handleDragLeave(event) {
+    const day = event.target.closest('[data-drop-date]');
+    if (day && !day.contains(event.relatedTarget)) day.classList.remove('is-drag-over');
+  }
+
+  function handleDrop(event) {
+    const day = event.target.closest('[data-drop-date]');
+    if (!day) return;
+    event.preventDefault();
+    let payload = null;
+    try {
+      payload = JSON.parse(event.dataTransfer.getData('text/plain'));
+    } catch (_) {
+      payload = null;
+    }
+    clearDragHighlights();
+    if (!payload || !payload.taskId) return;
+    const task = taskById(payload.taskId);
+    if (!task) return;
+    const date = day.dataset.dropDate;
+    if (!date) return;
+    if (payload.type === 'plan') {
+      const plan = (task.plans || []).find((item) => item.id === payload.planId);
+      if (!plan || plan.date === date) return;
+      if ((task.plans || []).some((item) => item.id !== plan.id && item.date === date)) {
+        showToast('这个任务在这天已经有一个计划了。', { title: '已有计划' });
+        return;
+      }
+      plan.date = date;
+      syncTaskLegacy(task);
+      saveNow();
+      render();
+      showToast(`已移到 ${formatDateShort(date)}。`, { title: '计划已调整' });
+      return;
+    }
+    if (payload.type === 'task') {
+      if (!isOpen(task)) {
+        showToast('已完成的任务不再排期，需要先取消完成。', { title: '无法安排' });
+        return;
+      }
+      if ((task.plans || []).some((item) => item.date === date)) {
+        showToast('这个任务在这天已经有一个计划了。', { title: '已有计划' });
+        return;
+      }
+      task.plans = [...(task.plans || []), { id: uid('plan'), date, startTime: '' }];
+      syncTaskLegacy(task);
+      saveNow();
+      render();
+      showToast(`已安排到 ${formatDateShort(date)}。`, { title: '已加入计划' });
+    }
+  }
+
   function handleClick(event) {
     const actionElement = event.target.closest('[data-action]');
     if (!actionElement) return;
@@ -2851,13 +3019,45 @@
     if (action === 'new-task') {
       const defaults = {};
       if (actionElement.dataset.date) defaults.due = actionElement.dataset.date;
-      if (actionElement.dataset.scheduled) defaults.scheduledDate = actionElement.dataset.scheduled;
-      if (actionElement.dataset.start) defaults.startTime = actionElement.dataset.start;
-      if (actionElement.dataset.end) defaults.endTime = actionElement.dataset.end;
+      if (actionElement.dataset.planDate) {
+        defaults.plans = [{
+          id: uid('plan'),
+          date: actionElement.dataset.planDate,
+          startTime: actionElement.dataset.planTime || ''
+        }];
+      }
       if (actionElement.dataset.project) defaults.projectId = actionElement.dataset.project;
       if (actionElement.dataset.section) defaults.sectionId = actionElement.dataset.section;
       ui.returnProjectId = actionElement.closest('[data-project-detail]')?.dataset.projectDetail || '';
       openTaskModal(null, defaults);
+      return;
+    }
+    if (action === 'add-plan-row') {
+      const rows = document.getElementById('planRows');
+      if (rows) {
+        rows.insertAdjacentHTML('beforeend', planRowHTML({}));
+        rows.lastElementChild?.querySelector('input[type="date"]')?.focus();
+      }
+      return;
+    }
+    if (action === 'remove-plan-row') {
+      const row = actionElement.closest('[data-plan-row]');
+      if (row) {
+        row.remove();
+        const rows = document.getElementById('planRows');
+        if (rows && !rows.children.length) rows.insertAdjacentHTML('beforeend', planRowHTML({}));
+      }
+      return;
+    }
+    if (action === 'remove-plan') {
+      const task = taskById(actionElement.dataset.taskId);
+      if (!task) return;
+      const planId = actionElement.dataset.planId;
+      task.plans = (task.plans || []).filter((plan) => plan.id !== planId);
+      syncTaskLegacy(task);
+      saveNow();
+      render();
+      showToast('已从这天移除，任务本身还在。', { title: '计划已移除' });
       return;
     }
     if (action === 'edit-task') {
@@ -3019,20 +3219,6 @@
     if (action === 'week-today') {
       ui.weekCursor = new Date();
       render();
-      return;
-    }
-    if (action === 'week-slot') {
-      const rect = actionElement.getBoundingClientRect();
-      const y = event.clientY - rect.top;
-      let minutes = 360 + Math.floor((y / 48) * 2) * 30;
-      minutes = clamp(minutes, 360, 1380);
-      const start = minutesToTime(minutes);
-      const end = minutesToTime(minutes + 60);
-      openTaskModal(null, {
-        scheduledDate: actionElement.dataset.date,
-        startTime: start,
-        endTime: end
-      });
       return;
     }
     if (action === 'open-day') {
@@ -3198,6 +3384,11 @@
   document.addEventListener('input', handleInput);
   document.addEventListener('submit', handleSubmit);
   document.addEventListener('keydown', handleKeydown);
+  document.addEventListener('dragstart', handleDragStart);
+  document.addEventListener('dragover', handleDragOver);
+  document.addEventListener('dragleave', handleDragLeave);
+  document.addEventListener('drop', handleDrop);
+  document.addEventListener('dragend', clearDragHighlights);
 
   window.addEventListener('hashchange', () => {
     const next = location.hash.replace(/^#\/?/, '') || 'dashboard';
